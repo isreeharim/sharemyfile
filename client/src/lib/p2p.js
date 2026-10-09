@@ -5,7 +5,20 @@ const CHUNK_SIZE = 64 * 1024;
 const BUFFER_THRESHOLD = 1024 * 1024; // 1 MB backpressure threshold
 
 export class P2PManager {
-  constructor({ deviceInfo, onPeerJoin, onPeerLeave, onProgress, onFileReceived, onTextReceived, onStatusChange }) {
+  constructor({ 
+    deviceInfo, 
+    initialRoomId,
+    initialPasskey,
+    onPeerJoin, 
+    onPeerLeave, 
+    onProgress, 
+    onFileReceived, 
+    onTextReceived, 
+    onStatusChange,
+    onPasskeyRequired,
+    onAuthFailed,
+    onAuthSuccess
+  }) {
     this.deviceInfo = deviceInfo;
     this.onPeerJoin = onPeerJoin || (() => {});
     this.onPeerLeave = onPeerLeave || (() => {});
@@ -13,13 +26,22 @@ export class P2PManager {
     this.onFileReceived = onFileReceived || (() => {});
     this.onTextReceived = onTextReceived || (() => {});
     this.onStatusChange = onStatusChange || (() => {});
+    this.onPasskeyRequired = onPasskeyRequired || (() => {});
+    this.onAuthFailed = onAuthFailed || (() => {});
+    this.onAuthSuccess = onAuthSuccess || (() => {});
 
     this.peer = null;
     this.myPeerId = null;
     this.isHost = false;
-    this.roomId = null;
+    
+    // Parse room and passkey from URL or parameters
+    const urlParams = P2PManager.getRoomAndPinFromUrl();
+    this.roomId = initialRoomId || urlParams.roomId;
+    this.passkey = initialPasskey !== undefined ? initialPasskey : urlParams.pin;
+
     this.connections = new Map(); // peerId -> DataConnection
     this.peerDetails = new Map(); // peerId -> deviceInfo
+    this.pendingAuthConns = new Map(); // peerId -> { conn, peerInfo } for unauthenticated connections
 
     // Active incoming transfers: fileId -> { meta, chunks, receivedBytes, startTime, lastLoaded, lastTime }
     this.incomingTransfers = new Map();
@@ -27,22 +49,30 @@ export class P2PManager {
     this.init();
   }
 
-  // Get or generate a room code
-  static getOrCreateRoomId() {
-    const hash = window.location.hash;
-    const match = hash.match(/room=([a-zA-Z0-9_-]+)/);
-    if (match && match[1]) {
-      return match[1].toLowerCase();
+  // Parse room and pin parameters from URL hash
+  static getRoomAndPinFromUrl() {
+    if (typeof window === 'undefined') return { roomId: 'default', pin: '' };
+    const hash = window.location.hash || '';
+    const roomMatch = hash.match(/room=([a-zA-Z0-9_-]+)/i);
+    const pinMatch = hash.match(/pin=([^&]+)/i);
+
+    const roomId = roomMatch && roomMatch[1] ? roomMatch[1].toLowerCase() : ('room-' + Math.random().toString(36).substring(2, 8));
+    const pin = pinMatch && pinMatch[1] ? decodeURIComponent(pinMatch[1]) : (localStorage.getItem(`smf_pin_${roomId}`) || '');
+
+    // Synchronize URL hash
+    if (!roomMatch) {
+      window.location.hash = pin ? `room=${roomId}&pin=${encodeURIComponent(pin)}` : `room=${roomId}`;
     }
-    // Generate a clean 6-character room code
-    const generated = 'room-' + Math.random().toString(36).substring(2, 8);
-    window.location.hash = `room=${generated}`;
-    return generated;
+
+    return { roomId, pin };
   }
 
   init() {
-    this.roomId = P2PManager.getOrCreateRoomId();
-    this.onStatusChange({ status: 'connecting', roomId: this.roomId });
+    this.onStatusChange({ 
+      status: 'connecting', 
+      roomId: this.roomId, 
+      hasPasskey: !!this.passkey 
+    });
 
     // Try to register as the Room Host first
     const hostPeerId = `smf-${this.roomId}`;
@@ -50,7 +80,6 @@ export class P2PManager {
   }
 
   tryConnectAsHost(hostPeerId) {
-    // Attempt to register as host
     const peer = new Peer(hostPeerId, {
       debug: 1,
       config: {
@@ -65,24 +94,29 @@ export class P2PManager {
       this.peer = peer;
       this.myPeerId = id;
       this.isHost = true;
-      this.onStatusChange({ status: 'ready', isHost: true, peerId: id, roomId: this.roomId });
+      this.onStatusChange({ 
+        status: 'ready', 
+        isHost: true, 
+        peerId: id, 
+        roomId: this.roomId,
+        hasPasskey: !!this.passkey
+      });
       this.setupHostListeners(peer);
     });
 
     peer.on('error', (err) => {
-      // If ID is already taken, someone else is the room host -> connect as guest
+      // If ID is already taken, someone else is host -> connect as guest
       if (err.type === 'unavailable-id') {
         peer.destroy();
         this.connectAsGuest(hostPeerId);
       } else {
         console.warn('P2P Host Peer error:', err);
-        this.onStatusChange({ status: 'error', error: err.message });
+        this.onStatusChange({ status: 'error', error: err.message, roomId: this.roomId });
       }
     });
   }
 
   connectAsGuest(hostPeerId) {
-    // Connect with a random guest ID
     const guestId = `guest-${Math.random().toString(36).substring(2, 9)}`;
     const peer = new Peer(guestId, {
       debug: 1,
@@ -98,38 +132,44 @@ export class P2PManager {
       this.peer = peer;
       this.myPeerId = id;
       this.isHost = false;
-      this.onStatusChange({ status: 'ready', isHost: false, peerId: id, roomId: this.roomId });
+      this.onStatusChange({ 
+        status: 'ready', 
+        isHost: false, 
+        peerId: id, 
+        roomId: this.roomId,
+        hasPasskey: !!this.passkey
+      });
 
       // Connect to the host
       const conn = peer.connect(hostPeerId, { reliable: true });
-      this.setupConnection(conn);
+      this.setupConnection(conn, true);
     });
 
     peer.on('connection', (conn) => {
-      this.setupConnection(conn);
+      this.setupConnection(conn, false);
     });
 
     peer.on('error', (err) => {
       console.warn('P2P Guest error:', err);
-      this.onStatusChange({ status: 'error', error: err.message });
+      this.onStatusChange({ status: 'error', error: err.message, roomId: this.roomId });
     });
   }
 
   setupHostListeners(peer) {
     peer.on('connection', (conn) => {
-      this.setupConnection(conn);
+      this.setupConnection(conn, false);
     });
   }
 
-  setupConnection(conn) {
+  setupConnection(conn, isInitiator = false) {
     conn.on('open', () => {
-      this.connections.set(conn.peer, conn);
-
-      // Send my device info
+      // Send handshake with my device info and my room passkey
       conn.send({
         type: 'handshake',
         device: this.deviceInfo,
-        peerId: this.myPeerId
+        peerId: this.myPeerId,
+        passkey: this.passkey || '',
+        isInitiator
       });
     });
 
@@ -139,9 +179,12 @@ export class P2PManager {
 
     conn.on('close', () => {
       this.connections.delete(conn.peer);
+      this.pendingAuthConns.delete(conn.peer);
       const departingPeer = this.peerDetails.get(conn.peer);
       this.peerDetails.delete(conn.peer);
-      this.onPeerLeave(conn.peer, departingPeer);
+      if (departingPeer) {
+        this.onPeerLeave(conn.peer, departingPeer);
+      }
     });
 
     conn.on('error', (err) => {
@@ -150,7 +193,7 @@ export class P2PManager {
   }
 
   handleIncomingData(conn, data) {
-    // Handle binary chunk (ArrayBuffer)
+    // 1. Binary chunk transfer
     if (data instanceof ArrayBuffer || data?.byteLength !== undefined) {
       this.handleBinaryChunk(conn, data);
       return;
@@ -169,8 +212,120 @@ export class P2PManager {
           ip: 'Direct LAN P2P',
           joinedAt: new Date().toISOString()
         };
-        this.peerDetails.set(conn.peer, peerInfo);
-        this.onPeerJoin(peerInfo);
+
+        // If I am the Host and I have a Passkey configured:
+        if (this.isHost && this.passkey) {
+          if (data.passkey === this.passkey) {
+            // Authentication successful
+            this.connections.set(conn.peer, conn);
+            this.peerDetails.set(conn.peer, peerInfo);
+            conn.send({ 
+              type: 'auth_success', 
+              device: this.deviceInfo,
+              isHost: true,
+              roomName: this.roomId 
+            });
+            this.onPeerJoin(peerInfo);
+          } else {
+            // Passkey required or incorrect: challenge guest
+            this.pendingAuthConns.set(conn.peer, { conn, peerInfo });
+            conn.send({ 
+              type: 'auth_challenge', 
+              roomName: this.roomId, 
+              message: 'Room passkey required to connect' 
+            });
+          }
+        } else {
+          // No host passkey needed: accept directly
+          this.connections.set(conn.peer, conn);
+          this.peerDetails.set(conn.peer, peerInfo);
+          conn.send({ 
+            type: 'auth_success', 
+            device: this.deviceInfo,
+            isHost: this.isHost,
+            roomName: this.roomId 
+          });
+          this.onPeerJoin(peerInfo);
+        }
+        break;
+      }
+
+      // Guest receives challenge: passkey prompt
+      case 'auth_challenge': {
+        this.onPasskeyRequired({
+          roomName: data.roomName || this.roomId,
+          message: data.message,
+          submitPasskey: (enteredPin) => {
+            this.passkey = enteredPin;
+            localStorage.setItem(`smf_pin_${this.roomId}`, enteredPin);
+            conn.send({
+              type: 'auth_attempt',
+              passkey: enteredPin,
+              device: this.deviceInfo
+            });
+          }
+        });
+        break;
+      }
+
+      // Host receives auth attempt from guest
+      case 'auth_attempt': {
+        const pending = this.pendingAuthConns.get(conn.peer);
+        if (data.passkey === this.passkey) {
+          // Success
+          const peerInfo = pending ? pending.peerInfo : {
+            id: conn.peer,
+            name: data.device?.name || 'Remote Peer',
+            deviceType: data.device?.deviceType || 'unknown',
+            os: data.device?.os || 'unknown',
+            browser: data.device?.browser || 'unknown',
+            ip: 'Direct LAN P2P',
+            joinedAt: new Date().toISOString()
+          };
+          this.connections.set(conn.peer, conn);
+          this.peerDetails.set(conn.peer, peerInfo);
+          this.pendingAuthConns.delete(conn.peer);
+
+          conn.send({ 
+            type: 'auth_success', 
+            device: this.deviceInfo,
+            isHost: true,
+            roomName: this.roomId 
+          });
+          this.onPeerJoin(peerInfo);
+        } else {
+          // Failed attempt
+          conn.send({
+            type: 'auth_fail',
+            reason: 'Incorrect passkey'
+          });
+        }
+        break;
+      }
+
+      // Guest receives auth confirmation
+      case 'auth_success': {
+        const hostPeerInfo = {
+          id: conn.peer,
+          name: data.device?.name || (data.isHost ? 'Room Host' : 'Remote Peer'),
+          deviceType: data.device?.deviceType || 'unknown',
+          os: data.device?.os || 'unknown',
+          browser: data.device?.browser || 'unknown',
+          ip: 'Direct LAN P2P',
+          joinedAt: new Date().toISOString()
+        };
+        this.connections.set(conn.peer, conn);
+        this.peerDetails.set(conn.peer, hostPeerInfo);
+        this.onPeerJoin(hostPeerInfo);
+        this.onAuthSuccess({ roomName: data.roomName || this.roomId });
+        break;
+      }
+
+      // Guest receives auth failure
+      case 'auth_fail': {
+        this.onAuthFailed({
+          reason: data.reason || 'Invalid passkey'
+        });
         break;
       }
 
@@ -186,7 +341,6 @@ export class P2PManager {
       }
 
       case 'file-meta': {
-        // Initialize incoming transfer
         const transfer = {
           meta: data,
           chunks: [],
@@ -248,8 +402,6 @@ export class P2PManager {
   }
 
   handleBinaryChunk(conn, arrayBuffer) {
-    // ArrayBuffer received: header is 36 bytes (fileId UUID or string)
-    // We package the chunk as: [4 bytes headerLength][header JSON][raw chunk bytes]
     try {
       const dataView = new DataView(arrayBuffer);
       const headerLength = dataView.getUint32(0);
@@ -290,7 +442,54 @@ export class P2PManager {
     }
   }
 
-  // Send a text note to all or specific peer
+  // Switch or create a new room with an optional passkey
+  switchRoom(newRoomId, newPasskey = '', includePinInUrl = false) {
+    const cleanRoomId = (newRoomId || '').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '') || ('room-' + Math.random().toString(36).substring(2, 8));
+    
+    // Cleanup existing peer connections
+    this.destroy();
+
+    this.roomId = cleanRoomId;
+    this.passkey = newPasskey || '';
+
+    if (newPasskey) {
+      localStorage.setItem(`smf_pin_${cleanRoomId}`, newPasskey);
+    } else {
+      localStorage.removeItem(`smf_pin_${cleanRoomId}`);
+    }
+
+    // Update URL hash
+    if (typeof window !== 'undefined') {
+      window.location.hash = (newPasskey && includePinInUrl) 
+        ? `room=${cleanRoomId}&pin=${encodeURIComponent(newPasskey)}`
+        : `room=${cleanRoomId}`;
+    }
+
+    this.connections.clear();
+    this.peerDetails.clear();
+    this.pendingAuthConns.clear();
+
+    this.init();
+  }
+
+  // Update passkey on the current room
+  updatePasskey(newPasskey) {
+    this.passkey = newPasskey || '';
+    if (newPasskey) {
+      localStorage.setItem(`smf_pin_${this.roomId}`, newPasskey);
+    } else {
+      localStorage.removeItem(`smf_pin_${this.roomId}`);
+    }
+    this.onStatusChange({
+      status: 'ready',
+      isHost: this.isHost,
+      peerId: this.myPeerId,
+      roomId: this.roomId,
+      hasPasskey: !!this.passkey
+    });
+  }
+
+  // Send a text note
   sendText(text, targetPeerId = null) {
     const payload = {
       type: 'text-message',
@@ -309,7 +508,7 @@ export class P2PManager {
     }
   }
 
-  // Stream a file directly over WebRTC DataChannel with chunking & backpressure
+  // Stream file chunks over WebRTC DataChannel
   async sendFile(file, targetPeerId = null, onLocalProgress = () => {}) {
     const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
@@ -324,7 +523,7 @@ export class P2PManager {
     }
 
     if (targets.length === 0) {
-      throw new Error('No peer connected on this Wi-Fi network yet.');
+      throw new Error('No authenticated peer connected in this room.');
     }
 
     // 1. Send file metadata
@@ -351,7 +550,6 @@ export class P2PManager {
       const blobSlice = file.slice(start, end);
       const arrayBuffer = await blobSlice.arrayBuffer();
 
-      // Encode header
       const headerStr = JSON.stringify({ fileId, chunkIndex: i });
       const encoder = new TextEncoder();
       const headerBytes = encoder.encode(headerStr);
@@ -364,7 +562,7 @@ export class P2PManager {
       packetUint8.set(headerBytes, 4);
       packetUint8.set(new Uint8Array(arrayBuffer), 4 + headerBytes.byteLength);
 
-      // Backpressure check on data channels
+      // Backpressure check
       for (const conn of targets) {
         if (conn.dataChannel && conn.dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
           await new Promise((resolve) => {
@@ -403,7 +601,7 @@ export class P2PManager {
       });
     }
 
-    // 3. Send file completion
+    // 3. Complete
     targets.forEach(conn => {
       conn.send({
         type: 'file-complete',
@@ -425,6 +623,10 @@ export class P2PManager {
   destroy() {
     this.connections.forEach(conn => conn.close());
     this.connections.clear();
-    if (this.peer) this.peer.destroy();
+    this.pendingAuthConns.clear();
+    if (this.peer) {
+      this.peer.destroy();
+      this.peer = null;
+    }
   }
 }

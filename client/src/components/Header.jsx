@@ -9,7 +9,11 @@ import {
   Check, 
   Copy, 
   Sun, 
-  Moon 
+  Moon,
+  Lock,
+  Unlock,
+  Hash,
+  Key
 } from 'lucide-react';
 import { saveDeviceName } from '../utils/deviceDetector';
 
@@ -20,7 +24,10 @@ export default function Header({
   serverInfo,
   onOpenQr,
   isDark,
-  onToggleTheme
+  onToggleTheme,
+  onOpenRoomManager,
+  currentRoomId,
+  hasPasskey
 }) {
   const [isEditing, setIsEditing] = useState(false);
   const [newName, setNewName] = useState(deviceInfo.name);
@@ -75,12 +82,33 @@ export default function Header({
           <button
             onClick={copyIp}
             title="Click to copy sharing URL"
-            className="hidden md:flex items-center gap-2 px-2.5 py-1 rounded-sm border border-black/10 dark:border-white/15 bg-black/[0.02] dark:bg-white/[0.04] text-xs font-mono text-slate-700 dark:text-slate-300 hover:border-black/30 dark:hover:border-white/40 transition-colors"
+            className="hidden lg:flex items-center gap-2 px-2.5 py-1 rounded-sm border border-black/10 dark:border-white/15 bg-black/[0.02] dark:bg-white/[0.04] text-xs font-mono text-slate-700 dark:text-slate-300 hover:border-black/30 dark:hover:border-white/40 transition-colors"
           >
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
             <span>{serverInfo.url}</span>
             <Copy className="w-3 h-3 text-slate-400 ml-0.5" />
             {copiedIp && <span className="text-[#fe7141] text-[10px] font-bold">COPIED</span>}
+          </button>
+        )}
+
+        {/* Room & Security Passkey Badge */}
+        {currentRoomId && (
+          <button
+            onClick={onOpenRoomManager}
+            title="Configure or Switch Room / Security Passkey"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-sm border border-black/10 dark:border-white/15 bg-black/[0.02] dark:bg-white/[0.04] text-xs font-mono text-slate-700 dark:text-slate-300 hover:border-[#fe7141] transition-colors cursor-pointer"
+          >
+            {hasPasskey ? (
+              <Lock className="w-3 h-3 text-[#fe7141]" />
+            ) : (
+              <Hash className="w-3 h-3 text-slate-400" />
+            )}
+            <span className="font-bold text-[11px] truncate max-w-[110px] sm:max-w-none">
+              #{currentRoomId.toUpperCase()}
+            </span>
+            {hasPasskey && (
+              <span className="w-1.5 h-1.5 rounded-full bg-[#fe7141] animate-pulse" />
+            )}
           </button>
         )}
 

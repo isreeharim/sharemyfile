@@ -17,6 +17,8 @@ import TextShareCard from './components/TextShareCard';
 import FileManager from './components/FileManager';
 import QrModal from './components/QrModal';
 import TransferApprovalModal from './components/TransferApprovalModal';
+import RoomManagerModal from './components/RoomManagerModal';
+import PasskeyPromptModal from './components/PasskeyPromptModal';
 import { BackgroundGrid } from './components/BackgroundGrid';
 import { P2PManager } from './lib/p2p';
 
@@ -27,8 +29,17 @@ export default function App() {
   const [currentDeviceId, setCurrentDeviceId] = useState(null);
   const [peers, setPeers] = useState([]);
   const [p2pPeers, setP2pPeers] = useState([]);
-  const [p2pInfo, setP2pInfo] = useState({ isHost: false, roomId: '', peerId: '', status: 'init' });
+  const [p2pInfo, setP2pInfo] = useState({ isHost: false, roomId: '', peerId: '', status: 'init', hasPasskey: false });
   const p2pManagerRef = useRef(null);
+
+  // Room & Passkey Security Modals
+  const [isRoomManagerOpen, setIsRoomManagerOpen] = useState(false);
+  const [passkeyPrompt, setPasskeyPrompt] = useState({
+    isOpen: false,
+    roomName: '',
+    errorMessage: '',
+    submitPasskey: null
+  });
 
   const [selectedPeerId, setSelectedPeerId] = useState(null);
   const [serverInfo, setServerInfo] = useState(null);
@@ -256,6 +267,28 @@ export default function App() {
       },
       onStatusChange: (status) => {
         setP2pInfo(prev => ({ ...prev, ...status }));
+      },
+      onPasskeyRequired: ({ roomName, message, submitPasskey }) => {
+        setPasskeyPrompt({
+          isOpen: true,
+          roomName,
+          errorMessage: '',
+          submitPasskey
+        });
+        showNotification(`Passkey required to enter #${roomName?.toUpperCase()}`, 'info');
+      },
+      onAuthFailed: ({ reason }) => {
+        setPasskeyPrompt(prev => ({
+          ...prev,
+          errorMessage: reason || 'Invalid passkey. Please try again.'
+        }));
+        showNotification('Passkey authentication failed.', 'error');
+      },
+      onAuthSuccess: ({ roomName }) => {
+        setPasskeyPrompt(prev => ({ ...prev, isOpen: false, errorMessage: '' }));
+        showNotification(`Authenticated to #${roomName?.toUpperCase()}!`, 'success');
+        if (navigator.vibrate) navigator.vibrate([40, 40, 80]);
+        confetti({ particleCount: 75, spread: 65, origin: { y: 0.6 } });
       }
     });
 
@@ -265,6 +298,14 @@ export default function App() {
       p2p.destroy();
     };
   }, [deviceInfo]);
+
+  const handleSwitchRoom = (newRoomId, newPasskey, includePinInUrl = false) => {
+    if (p2pManagerRef.current) {
+      p2pManagerRef.current.switchRoom(newRoomId, newPasskey, includePinInUrl);
+      setP2pPeers([]);
+      showNotification(`Switched to room #${newRoomId.toUpperCase()}${newPasskey ? ' (Passkey Protected)' : ''}`, 'info');
+    }
+  };
 
   const handleUpdateDeviceName = (name) => {
     setDeviceInfo(prev => ({ ...prev, name }));
@@ -535,6 +576,9 @@ export default function App() {
         onOpenQr={() => setIsQrOpen(true)}
         isDark={isDark}
         onToggleTheme={toggleTheme}
+        onOpenRoomManager={() => setIsRoomManagerOpen(true)}
+        currentRoomId={p2pInfo.roomId}
+        hasPasskey={p2pInfo.hasPasskey}
       />
 
       {/* Main Container */}
@@ -705,6 +749,29 @@ export default function App() {
         selectedIp={selectedIp}
         onSelectIp={setSelectedIp}
         targetUrl={shareUrl}
+      />
+
+      {/* Room Manager & Security Passkey Modal */}
+      <RoomManagerModal
+        isOpen={isRoomManagerOpen}
+        onClose={() => setIsRoomManagerOpen(false)}
+        currentRoomId={p2pInfo.roomId}
+        hasPasskey={p2pInfo.hasPasskey}
+        onSwitchRoom={handleSwitchRoom}
+        shareUrl={shareUrl}
+      />
+
+      {/* Passkey Authentication Prompt Modal */}
+      <PasskeyPromptModal
+        isOpen={passkeyPrompt.isOpen}
+        roomName={passkeyPrompt.roomName}
+        errorMessage={passkeyPrompt.errorMessage}
+        onSubmitPasskey={(pin) => {
+          if (passkeyPrompt.submitPasskey) {
+            passkeyPrompt.submitPasskey(pin);
+          }
+        }}
+        onClose={() => setPasskeyPrompt(prev => ({ ...prev, isOpen: false }))}
       />
 
       {/* Transfer Approval Modal */}
