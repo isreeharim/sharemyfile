@@ -193,13 +193,12 @@ export class P2PManager {
   }
 
   handleIncomingData(conn, data) {
-    // 1. Binary chunk transfer
-    if (data instanceof ArrayBuffer || data?.byteLength !== undefined) {
-      this.handleBinaryChunk(conn, data);
+    if (!data) return;
+
+    if (typeof data !== 'object' || !data.type) {
+      console.warn('Unexpected data packet received:', data);
       return;
     }
-
-    if (typeof data !== 'object' || !data.type) return;
 
     switch (data.type) {
       case 'handshake': {
@@ -343,7 +342,7 @@ export class P2PManager {
       case 'file-meta': {
         const transfer = {
           meta: data,
-          chunks: [],
+          chunks: new Array(data.totalChunks),
           receivedBytes: 0,
           startTime: Date.now(),
           lastLoaded: 0,
@@ -362,17 +361,76 @@ export class P2PManager {
         break;
       }
 
+      case 'file-chunk': {
+        const transfer = this.incomingTransfers.get(data.fileId);
+        if (transfer && data.chunk) {
+          let rawChunk = data.chunk;
+          if (rawChunk instanceof Uint8Array) {
+            rawChunk = rawChunk.buffer.slice(rawChunk.byteOffset, rawChunk.byteOffset + rawChunk.byteLength);
+          }
+          const chunkLen = rawChunk.byteLength || rawChunk.size || 0;
+
+          transfer.chunks[data.chunkIndex] = rawChunk;
+          transfer.receivedBytes += chunkLen;
+
+          const now = Date.now();
+          const timeDiff = (now - transfer.lastTime) / 1000;
+          let speed = 0;
+          if (timeDiff >= 0.2) {
+            speed = (transfer.receivedBytes - transfer.lastLoaded) / timeDiff;
+            transfer.lastLoaded = transfer.receivedBytes;
+            transfer.lastTime = now;
+          }
+
+          const pct = Math.min(100, Math.round((transfer.receivedBytes / transfer.meta.size) * 100));
+
+          this.onProgress({
+            fileId: data.fileId,
+            fileName: transfer.meta.name,
+            progress: pct,
+            speed,
+            transferred: transfer.receivedBytes,
+            total: transfer.meta.size,
+            status: 'transferring'
+          });
+        }
+        break;
+      }
+
       case 'file-complete': {
         const transfer = this.incomingTransfers.get(data.fileId);
         if (transfer) {
-          const blob = new Blob(transfer.chunks, { type: transfer.meta.mimeType || 'application/octet-stream' });
+          const orderedChunks = [];
+          for (let i = 0; i < transfer.meta.totalChunks; i++) {
+            if (transfer.chunks[i]) {
+              orderedChunks.push(transfer.chunks[i]);
+            }
+          }
+
+          const blob = new Blob(orderedChunks, { type: transfer.meta.mimeType || 'application/octet-stream' });
+          console.log(`[P2P Assembly] File: "${transfer.meta.name}", Chunks: ${orderedChunks.length}/${transfer.meta.totalChunks}, Blob Size: ${blob.size} bytes (Expected: ${transfer.meta.size} bytes)`);
+
+          if (blob.size === 0 && transfer.meta.size > 0) {
+            console.error('[P2P Assembly Error] Assembled blob is 0 bytes!');
+            this.onProgress({
+              fileId: data.fileId,
+              progress: 0,
+              speed: 0,
+              transferred: 0,
+              total: transfer.meta.size,
+              status: 'error'
+            });
+            return;
+          }
+
           const url = URL.createObjectURL(blob);
           const receivedFile = {
             id: transfer.meta.fileId,
             originalName: transfer.meta.name,
-            size: transfer.meta.size,
+            size: blob.size,
             mimeType: transfer.meta.mimeType,
             uploadedAt: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
             uploaderName: this.peerDetails.get(conn.peer)?.name || 'Peer',
             uploaderType: this.peerDetails.get(conn.peer)?.deviceType || 'unknown',
             uploaderIp: 'Wi-Fi P2P',
@@ -386,10 +444,25 @@ export class P2PManager {
             fileId: data.fileId,
             progress: 100,
             speed: 0,
-            transferred: transfer.meta.size,
-            total: transfer.meta.size,
+            transferred: blob.size,
+            total: blob.size,
             status: 'completed'
           });
+
+          // Trigger automatic browser download on receiver device
+          try {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = transfer.meta.name;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+              if (document.body.contains(a)) document.body.removeChild(a);
+            }, 1000);
+          } catch (err) {
+            console.warn('Auto download error:', err);
+          }
 
           this.onFileReceived(receivedFile);
         }
@@ -398,47 +471,6 @@ export class P2PManager {
 
       default:
         break;
-    }
-  }
-
-  handleBinaryChunk(conn, arrayBuffer) {
-    try {
-      const dataView = new DataView(arrayBuffer);
-      const headerLength = dataView.getUint32(0);
-      const decoder = new TextDecoder();
-      const headerBytes = new Uint8Array(arrayBuffer, 4, headerLength);
-      const header = JSON.parse(decoder.decode(headerBytes));
-
-      const chunkData = arrayBuffer.slice(4 + headerLength);
-      const transfer = this.incomingTransfers.get(header.fileId);
-
-      if (transfer) {
-        transfer.chunks.push(chunkData);
-        transfer.receivedBytes += chunkData.byteLength;
-
-        const now = Date.now();
-        const timeDiff = (now - transfer.lastTime) / 1000;
-        let speed = 0;
-        if (timeDiff >= 0.25) {
-          speed = (transfer.receivedBytes - transfer.lastLoaded) / timeDiff;
-          transfer.lastLoaded = transfer.receivedBytes;
-          transfer.lastTime = now;
-        }
-
-        const pct = Math.min(100, Math.round((transfer.receivedBytes / transfer.meta.size) * 100));
-
-        this.onProgress({
-          fileId: header.fileId,
-          fileName: transfer.meta.name,
-          progress: pct,
-          speed,
-          transferred: transfer.receivedBytes,
-          total: transfer.meta.size,
-          status: 'transferring'
-        });
-      }
-    } catch (e) {
-      console.error('Error handling binary chunk:', e);
     }
   }
 
@@ -550,24 +582,14 @@ export class P2PManager {
       const blobSlice = file.slice(start, end);
       const arrayBuffer = await blobSlice.arrayBuffer();
 
-      const headerStr = JSON.stringify({ fileId, chunkIndex: i });
-      const encoder = new TextEncoder();
-      const headerBytes = encoder.encode(headerStr);
-
-      const packetBuffer = new ArrayBuffer(4 + headerBytes.byteLength + arrayBuffer.byteLength);
-      const dataView = new DataView(packetBuffer);
-      dataView.setUint32(0, headerBytes.byteLength);
-
-      const packetUint8 = new Uint8Array(packetBuffer);
-      packetUint8.set(headerBytes, 4);
-      packetUint8.set(new Uint8Array(arrayBuffer), 4 + headerBytes.byteLength);
-
       // Backpressure check
       for (const conn of targets) {
-        if (conn.dataChannel && conn.dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
+        const dc = conn.dataChannel || conn._dc;
+        if (dc && dc.bufferedAmount > BUFFER_THRESHOLD) {
           await new Promise((resolve) => {
             const check = () => {
-              if (!conn.dataChannel || conn.dataChannel.bufferedAmount <= BUFFER_THRESHOLD / 2) {
+              const currentDc = conn.dataChannel || conn._dc;
+              if (!currentDc || currentDc.bufferedAmount <= BUFFER_THRESHOLD / 2) {
                 resolve();
               } else {
                 setTimeout(check, 10);
@@ -576,7 +598,12 @@ export class P2PManager {
             check();
           });
         }
-        conn.send(packetBuffer);
+        conn.send({
+          type: 'file-chunk',
+          fileId,
+          chunkIndex: i,
+          chunk: arrayBuffer
+        });
       }
 
       transferredBytes += (end - start);
